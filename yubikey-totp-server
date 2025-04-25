@@ -1,0 +1,125 @@
+#!/usr/bin/python3
+
+import syslog
+from dataclasses import dataclass
+from os import environ
+from pathlib import Path
+from time import sleep, time
+from typing import Any, Self
+
+import yaml
+from platformdirs import user_config_dir
+from ykman.device import list_all_devices
+from yubikit.core.smartcard import SmartCardConnection
+from yubikit.oath import OATH_TYPE, Credential, OathSession
+
+
+@dataclass
+class Secret:
+    dev: int
+    name: str
+
+
+@dataclass
+class Config:
+    devices: dict[int, str]
+    secrets: dict[str, Secret]
+    acl: dict[str, list[str]]
+
+    @classmethod
+    def load(cls) -> Self:
+        config_file = Path(user_config_dir()) / "yubikey-totp-server/config.yaml"
+        try:
+            with config_file.open("rt") as fp:
+                config = yaml.safe_load(fp)
+        except FileNotFoundError:
+            exit(f"Config file {config_file} not found.")
+
+        return cls(
+            devices=config["devices"],
+            secrets={
+                name: Secret(**secret) for name, secret in config["secrets"].items()
+            },
+            acl=config["acl"],
+        )
+
+
+def connect_to_device(serial: int) -> SmartCardConnection:
+    for dev, info in list_all_devices():
+        if info.serial == serial:
+            return dev.open_connection(SmartCardConnection)
+    raise Exception(f"Device {serial} not found")
+
+
+def get_ssh_publickey() -> str:
+    if not (filename := environ.get("SSH_USER_AUTH")):
+        exit("Connect through SSH and ensure that ExposeAuthInfo is set")
+
+    with open(filename, "rt") as fp:
+        for line in fp:
+            args = line.split()
+            if not args:
+                continue
+            if args[0] == "publickey":
+                return args[2]
+    exit("'publickey' not found")
+
+
+def get_secret(conf: Config) -> Secret:
+    if not (acl := conf.acl.get(get_ssh_publickey())):
+        exit("Pubkey unknown")
+
+    if not (secret_name := environ.get("SSH_ORIGINAL_COMMAND")):
+        exit("Available secrets: " + ", ".join(acl))
+
+    if secret_name not in acl:
+        exit("Access denied to secret")
+
+    return conf.secrets[secret_name]
+
+
+def get_timestamp(cred: Credential) -> float:
+    timestamp = time()
+
+    # If timestamp is near the end of the current token period, wait for next period
+    left = cred.period - timestamp % cred.period
+    if left > 5:
+        return timestamp
+
+    sleep(left)
+    return timestamp + left + 1
+
+
+def calc_totp(conf: Config, secret: Secret) -> str:
+    with connect_to_device(secret.dev) as conn:
+        oath = OathSession(conn)
+        oath.validate(oath.derive_key(conf.devices[secret.dev]))
+
+        for cred in oath.list_credentials():
+            if cred.name == secret.name:
+                break
+        else:
+            exit(f"Credential {secret.name} not found on yubikey.")
+
+        return oath.calculate_code(cred, get_timestamp(cred)).value
+
+
+def getsid() -> int | None:
+    try:
+        return int(Path("/proc/self/sessionid").read_text())
+    except FileNotFoundError:
+        return None
+
+
+syslog.openlog(logoption=syslog.LOG_PID, facility=syslog.LOG_AUTH)
+
+
+conf = Config.load()
+secret = get_secret(conf)
+code = calc_totp(conf, secret)
+syslog.syslog(
+    syslog.LOG_INFO,
+    f"Generated TOTP code for session={getsid()} dev={secret.dev} name={secret.name}",
+)
+
+print(code)
